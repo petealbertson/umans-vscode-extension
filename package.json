@@ -1,0 +1,61 @@
+{
+  "name": "umans-vscode-extension",
+  "publisher": "umans",
+  "displayName": "Umans AI",
+  "description": "Use Umans AI models in GitHub Copilot Chat",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/petealbertson/umans-vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.104.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "activationEvents": [
+    "onLanguageModelChatProvider:umans"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "umans",
+        "displayName": "Umans"
+      }
+    ],
+    "commands": [
+      {
+        "command": "umans.setApiKey",
+        "title": "Umans: Set API Key"
+      },
+      {
+        "command": "umans.clearApiKey",
+        "title": "Umans: Clear API Key"
+      }
+    ],
+    "configuration": {
+      "title": "Umans",
+      "properties": {
+        "umans.endpoint": {
+          "type": "string",
+          "default": "https://api.code.umans.ai",
+          "description": "Umans API endpoint URL"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/vscode": "^1.104.0",
+    "typescript": "^5.9.2"
+  }
+}
