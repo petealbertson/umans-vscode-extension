@@ -20,6 +20,7 @@
     "onLanguageModelChatProvider:umans"
   ],
   "main": "./out/extension.js",
+  "extensionKind": ["ui", "workspace"],
   "contributes": {
     "languageModelChatProviders": [
       {
