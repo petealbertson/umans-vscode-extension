@@ -12,29 +12,34 @@ interface UmansModelDef {
 }
 
 const MODELS: UmansModelDef[] = [
-    { id: 'umans-coder',     name: 'Umans Coder',    family: 'kimi-k2.7-code', maxInputTokens: 256000, maxOutputTokens: 8192, imageInput: true },
-    { id: 'umans-kimi-k2.7', name: 'Umans Kimi K2.7', family: 'kimi-k2.7',     maxInputTokens: 256000, maxOutputTokens: 8192, imageInput: true },
-    { id: 'umans-glm-5.2',   name: 'Umans GLM 5.2',  family: 'glm-5.2',        maxInputTokens: 400000, maxOutputTokens: 8192, imageInput: false },
-    { id: 'umans-flash',     name: 'Umans Flash',     family: 'qwen3.6-35b',    maxInputTokens: 256000, maxOutputTokens: 8192, imageInput: false },
+    { id: 'umans-coder',     name: 'Umans Coder',    family: 'kimi-k2.7-code', maxInputTokens: 256000, maxOutputTokens: 32768, imageInput: true },
+    { id: 'umans-kimi-k2.7', name: 'Umans Kimi K2.7', family: 'kimi-k2.7',     maxInputTokens: 256000, maxOutputTokens: 32768, imageInput: true },
+    { id: 'umans-glm-5.2',   name: 'Umans GLM 5.2',  family: 'glm-5.2',        maxInputTokens: 400000, maxOutputTokens: 32768, imageInput: false },
+    { id: 'umans-flash',     name: 'Umans Flash',     family: 'qwen3.6-35b',    maxInputTokens: 256000, maxOutputTokens: 32768, imageInput: false },
 ];
 
-// OpenAI message types
-interface OpenAIToolCall {
-    id: string;
-    type: 'function';
-    function: { name: string; arguments: string };
-}
-interface OpenAIContentPart {
-    type: 'text' | 'image_url';
+// --- Anthropic Messages API types ---
+
+interface AnthropicContentBlock {
+    type: 'text' | 'image' | 'tool_use' | 'tool_result';
     text?: string;
-    image_url?: { url: string; detail?: string };
-}
-interface OpenAIMessage {
-    role: 'system' | 'user' | 'assistant' | 'tool';
-    content?: string | Array<OpenAIContentPart> | null;
-    tool_calls?: OpenAIToolCall[];
-    tool_call_id?: string;
+    source?: { type: 'base64'; media_type: string; data: string };
+    id?: string;
     name?: string;
+    input?: object;
+    tool_use_id?: string;
+    content?: string | AnthropicContentBlock[];
+}
+
+interface AnthropicMessage {
+    role: 'user' | 'assistant';
+    content: string | AnthropicContentBlock[];
+}
+
+interface AnthropicTool {
+    name: string;
+    description: string;
+    input_schema: object;
 }
 
 export class UmansProvider implements vscode.LanguageModelChatProvider {
@@ -153,31 +158,32 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
         if (!endpoint.startsWith('https://') && !endpoint.startsWith('http://localhost') && !endpoint.startsWith('http://127.0.0.1')) {
             throw new Error('Umans: endpoint must use HTTPS (or http://localhost for development). Check the "umans.endpoint" setting.');
         }
-        const url = `${endpoint}/v1/chat/completions`;
+        const url = `${endpoint}/v1/messages`;
+
+        const modelDef = MODELS.find(m => m.id === model.id);
+        const maxTokens = modelDef?.maxOutputTokens ?? 32768;
 
         const body: Record<string, unknown> = {
             model: model.id,
             messages: this.convertMessages(messages),
+            max_tokens: maxTokens,
             stream: true,
         };
 
-        // tools
+        // tools (Anthropic format)
         if (options.tools && options.tools.length > 0) {
             body.tools = options.tools.map(t => ({
-                type: 'function',
-                function: {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.inputSchema ?? {},
-                },
+                name: t.name,
+                description: t.description,
+                input_schema: t.inputSchema ?? { type: 'object', properties: {} },
             }));
             if (options.toolMode === vscode.LanguageModelChatToolMode.Required) {
-                body.tool_choice = 'required';
+                body.tool_choice = { type: 'any' };
             }
         }
 
-        // model options (temperature, etc.)
-        const RESERVED_KEYS = new Set(['model', 'messages', 'stream', 'tools', 'tool_choice']);
+        // model options (temperature, etc.) — filter reserved keys
+        const RESERVED_KEYS = new Set(['model', 'messages', 'max_tokens', 'stream', 'tools', 'tool_choice']);
         if (options.modelOptions) {
             for (const [k, v] of Object.entries(options.modelOptions)) {
                 if (!RESERVED_KEYS.has(k)) {
@@ -196,7 +202,9 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    'x-api-key': apiKey,
                     'Authorization': `Bearer ${apiKey}`,
+                    'anthropic-version': '2023-06-01',
                 },
                 body: JSON.stringify(body),
                 signal: controller.signal,
@@ -251,80 +259,84 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
         }
     }
 
-    // --- message conversion ---
+    // --- message conversion (VS Code → Anthropic) ---
 
-    private convertMessages(messages: readonly vscode.LanguageModelChatRequestMessage[]): OpenAIMessage[] {
-        const out: OpenAIMessage[] = [];
+    private convertMessages(messages: readonly vscode.LanguageModelChatRequestMessage[]): AnthropicMessage[] {
+        const out: AnthropicMessage[] = [];
         for (const msg of messages) {
             const role = msg.role === vscode.LanguageModelChatMessageRole.User ? 'user' : 'assistant';
-            let textParts: string[] = [];
-            const imageParts: OpenAIContentPart[] = [];
-            const toolCalls: OpenAIToolCall[] = [];
-            const toolResults: { id: string; content: string }[] = [];
+            const textParts: string[] = [];
+            const imageBlocks: AnthropicContentBlock[] = [];
+            const toolUseBlocks: AnthropicContentBlock[] = [];
+            const toolResultBlocks: AnthropicContentBlock[] = [];
 
             for (const part of msg.content) {
                 if (part instanceof vscode.LanguageModelTextPart) {
                     textParts.push(part.value);
                 } else if (part instanceof vscode.LanguageModelDataPart) {
-                    // Convert image data to OpenAI image_url format (base64 data URL)
+                    // Convert image data to Anthropic image block format
                     if (part.mimeType.startsWith('image/')) {
                         const base64 = UmansProvider.uint8ToBase64(part.data);
-                        imageParts.push({
-                            type: 'image_url',
-                            image_url: {
-                                url: `data:${part.mimeType};base64,${base64}`,
+                        imageBlocks.push({
+                            type: 'image',
+                            source: {
+                                type: 'base64',
+                                media_type: part.mimeType,
+                                data: base64,
                             },
                         });
-                    } else {
-                        // Non-image data parts — include as text representation
-                        try {
-                            textParts.push(`[${part.mimeType}]`);
-                        } catch { /* skip */ }
                     }
+                    // Non-image data parts are skipped
                 } else if (part instanceof vscode.LanguageModelToolCallPart) {
-                    toolCalls.push({
+                    toolUseBlocks.push({
+                        type: 'tool_use',
                         id: part.callId,
-                        type: 'function',
-                        function: {
-                            name: part.name,
-                            arguments: JSON.stringify(part.input ?? {}),
-                        },
+                        name: part.name,
+                        input: part.input ?? {},
                     });
                 } else if (part instanceof vscode.LanguageModelToolResultPart) {
                     const resultText = part.content
                         .map(c => (c instanceof vscode.LanguageModelTextPart ? c.value : ''))
                         .join('\n');
-                    toolResults.push({ id: part.callId, content: resultText });
+                    toolResultBlocks.push({
+                        type: 'tool_result',
+                        tool_use_id: part.callId,
+                        content: resultText,
+                    });
                 }
             }
 
-            // Tool results go as separate 'tool' role messages
-            for (const tr of toolResults) {
-                out.push({ role: 'tool', content: tr.content, tool_call_id: tr.id });
+            // Tool results must be in a user-role message
+            if (toolResultBlocks.length > 0) {
+                out.push({
+                    role: 'user',
+                    content: toolResultBlocks,
+                });
             }
 
-            // If the message had only tool results, they're already pushed as 'tool' messages — skip the empty wrapper
-            if (textParts.length === 0 && toolCalls.length === 0 && toolResults.length === 0 && imageParts.length === 0) {
-                continue;
+            // Build the message content
+            const contentBlocks: AnthropicContentBlock[] = [];
+
+            // Text
+            const textContent = textParts.join('');
+            if (textContent.length > 0) {
+                contentBlocks.push({ type: 'text', text: textContent });
             }
 
-            // Build content: array if images present, otherwise string
-            let content: string | Array<OpenAIContentPart> | null;
-            if (imageParts.length > 0) {
-                content = [...textParts.map(t => ({ type: 'text' as const, text: t })), ...imageParts];
-            } else {
-                content = textParts.join('') || null;
+            // Images (user messages only, per Anthropic spec)
+            if (imageBlocks.length > 0 && role === 'user') {
+                contentBlocks.push(...imageBlocks);
             }
 
-            const message: OpenAIMessage = { role, content };
-            if (toolCalls.length > 0) {
-                message.tool_calls = toolCalls;
-                // assistant messages with tool calls can have null content
+            // Tool use (assistant messages)
+            if (toolUseBlocks.length > 0) {
+                contentBlocks.push(...toolUseBlocks);
             }
-            if (msg.name) {
-                message.name = msg.name;
+
+            // Only push if we have content blocks
+            if (contentBlocks.length > 0) {
+                out.push({ role, content: contentBlocks });
             }
-            out.push(message);
         }
         return out;
     }
@@ -337,7 +349,7 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
         return btoa(binary);
     }
 
-    // --- SSE parsing ---
+    // --- SSE parsing (Anthropic event format) ---
 
     private async parseSSE(
         body: ReadableStream<Uint8Array>,
@@ -347,8 +359,13 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
         const reader = body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
-        // accumulate tool call arguments by index
-        const toolCallBuffers: Map<number, { id: string; name: string; args: string }> = new Map();
+
+        // Track tool calls by index (Anthropic streams tool_use blocks with an index)
+        const toolCallBuffers: Map<number, { id: string; name: string; partialJson: string }> = new Map();
+
+        // SSE state: Anthropic uses named events (event: type\ndata: json\n\n)
+        let currentEvent = '';
+        let currentData = '';
 
         try {
             while (true) {
@@ -361,75 +378,139 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
                 buffer = lines.pop() ?? '';
 
                 for (const rawLine of lines) {
-                    const line = rawLine.trim();
-                    if (line === '' || line.startsWith(':')) { continue; }
-                    if (!line.startsWith('data:')) { continue; }
-                    const data = line.slice(5).trim();
-                    if (data === '[DONE]') {
-                        this.flushToolCalls(toolCallBuffers, progress);
-                        return;
+                    const line = rawLine.replace(/\r$/, '');
+
+                    // Empty line = event boundary — process the accumulated event
+                    if (line === '') {
+                        if (currentData) {
+                            this.handleSSEEvent(currentEvent, currentData, progress, toolCallBuffers);
+                        }
+                        currentEvent = '';
+                        currentData = '';
+                        continue;
                     }
-                    try {
-                        const json = JSON.parse(data);
-                        const choice = json.choices?.[0];
-                        if (!choice) { continue; }
-                        const delta = choice.delta;
-                        if (!delta) { continue; }
 
-                        // text content
-                        if (typeof delta.content === 'string' && delta.content.length > 0) {
-                            progress.report(new vscode.LanguageModelTextPart(delta.content));
-                        }
+                    // Comment line
+                    if (line.startsWith(':')) { continue; }
 
-                        // tool calls — accumulate
-                        if (Array.isArray(delta.tool_calls)) {
-                            for (const tc of delta.tool_calls) {
-                                const idx = tc.index ?? 0;
-                                const existing = toolCallBuffers.get(idx);
-                                const id = tc.id ?? existing?.id ?? `call_${idx}`;
-                                const name = tc.function?.name ?? existing?.name ?? '';
-                                const argsFragment = typeof tc.function?.arguments === 'string' ? tc.function.arguments : '';
-                                if (existing) {
-                                    existing.args += argsFragment;
-                                } else {
-                                    toolCallBuffers.set(idx, { id, name, args: argsFragment });
-                                }
-                            }
+                    // Event type
+                    if (line.startsWith('event:')) {
+                        currentEvent = line.slice(6).trim();
+                    } else if (line.startsWith('data:')) {
+                        const data = line.slice(5).trim();
+                        if (currentData) {
+                            currentData += '\n' + data;
+                        } else {
+                            currentData = data;
                         }
-
-                        // if finish_reason indicates tool calls, flush
-                        if (choice.finish_reason === 'tool_calls') {
-                            this.flushToolCalls(toolCallBuffers, progress);
-                        }
-                    } catch {
-                        // skip unparseable lines
                     }
                 }
             }
-            // stream ended — flush any remaining tool calls
+            // Process any remaining buffered event
+            if (currentData) {
+                this.handleSSEEvent(currentEvent, currentData, progress, toolCallBuffers);
+            }
+            // Flush any remaining tool calls
             this.flushToolCalls(toolCallBuffers, progress);
         } finally {
             reader.releaseLock();
         }
     }
 
-    private flushToolCalls(
-        buffers: Map<number, { id: string; name: string; args: string }>,
+    private handleSSEEvent(
+        event: string,
+        data: string,
+        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+        toolCallBuffers: Map<number, { id: string; name: string; partialJson: string }>
+    ): void {
+        let json: any;
+        try {
+            json = JSON.parse(data);
+        } catch {
+            return; // skip unparseable
+        }
+
+        switch (json.type) {
+            case 'content_block_start': {
+                const block = json.content_block;
+                const index = json.index;
+                if (block?.type === 'tool_use') {
+                    toolCallBuffers.set(index, {
+                        id: block.id ?? `call_${index}`,
+                        name: block.name ?? '',
+                        partialJson: '',
+                    });
+                }
+                break;
+            }
+            case 'content_block_delta': {
+                const delta = json.delta;
+                const index = json.index;
+                if (!delta) { break; }
+
+                if (delta.type === 'text_delta') {
+                    if (typeof delta.text === 'string' && delta.text.length > 0) {
+                        progress.report(new vscode.LanguageModelTextPart(delta.text));
+                    }
+                } else if (delta.type === 'input_json_delta') {
+                    // Accumulate tool call JSON fragments
+                    const existing = toolCallBuffers.get(index);
+                    if (existing) {
+                        const fragment = typeof delta.partial_json === 'string' ? delta.partial_json : '';
+                        existing.partialJson += fragment;
+                    }
+                }
+                break;
+            }
+            case 'content_block_stop': {
+                // Tool call is complete — flush it
+                const index = json.index;
+                if (toolCallBuffers.has(index)) {
+                    this.flushToolCall(index, toolCallBuffers, progress);
+                }
+                break;
+            }
+            case 'message_delta': {
+                // Check stop reason
+                if (json.delta?.stop_reason === 'tool_use') {
+                    this.flushToolCalls(toolCallBuffers, progress);
+                }
+                break;
+            }
+            case 'message_stop':
+                this.flushToolCalls(toolCallBuffers, progress);
+                break;
+            case 'error':
+                UmansProvider.outputChannel.appendLine(`Umans API error: ${JSON.stringify(json.error ?? json)}`);
+                break;
+        }
+    }
+
+    private flushToolCall(
+        index: number,
+        buffers: Map<number, { id: string; name: string; partialJson: string }>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>
     ): void {
-        if (buffers.size === 0) { return; }
-        const sorted = [...buffers.entries()].sort((a, b) => a[0] - b[0]);
-        for (const [, tc] of sorted) {
-            let input: object = {};
-            if (tc.args.length > 0) {
-                try {
-                    input = JSON.parse(tc.args);
-                } catch {
-                    UmansProvider.outputChannel.appendLine(`Warning: could not parse tool call arguments for "${tc.name}": ${tc.args.slice(0, 200)}`);
-                }
+        const tc = buffers.get(index);
+        if (!tc) { return; }
+        let input: object = {};
+        if (tc.partialJson.length > 0) {
+            try {
+                input = JSON.parse(tc.partialJson);
+            } catch {
+                UmansProvider.outputChannel.appendLine(`Warning: could not parse tool call arguments for "${tc.name}": ${tc.partialJson.slice(0, 200)}`);
             }
-            progress.report(new vscode.LanguageModelToolCallPart(tc.id, tc.name, input));
         }
-        buffers.clear();
+        progress.report(new vscode.LanguageModelToolCallPart(tc.id, tc.name, input));
+        buffers.delete(index);
+    }
+
+    private flushToolCalls(
+        buffers: Map<number, { id: string; name: string; partialJson: string }>,
+        progress: vscode.Progress<vscode.LanguageModelResponsePart>
+    ): void {
+        for (const index of [...buffers.keys()].sort((a, b) => a - b)) {
+            this.flushToolCall(index, buffers, progress);
+        }
     }
 }

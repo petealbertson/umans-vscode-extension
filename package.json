@@ -3,7 +3,7 @@
   "publisher": "umans",
   "displayName": "Umans AI",
   "description": "Use Umans AI models in GitHub Copilot Chat",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "MIT",
   "repository": {
     "type": "git",
