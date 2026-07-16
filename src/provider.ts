@@ -8,13 +8,14 @@ interface UmansModelDef {
     family: string;
     maxInputTokens: number;
     maxOutputTokens: number;
+    imageInput: boolean;
 }
 
 const MODELS: UmansModelDef[] = [
-    { id: 'umans-coder',     name: 'Umans Coder',    family: 'kimi-k2.7-code', maxInputTokens: 256000, maxOutputTokens: 8192 },
-    { id: 'umans-kimi-k2.7', name: 'Umans Kimi K2.7', family: 'kimi-k2.7',     maxInputTokens: 256000, maxOutputTokens: 8192 },
-    { id: 'umans-glm-5.2',   name: 'Umans GLM 5.2',  family: 'glm-5.2',        maxInputTokens: 400000, maxOutputTokens: 8192 },
-    { id: 'umans-flash',     name: 'Umans Flash',     family: 'qwen3.6-35b',    maxInputTokens: 256000, maxOutputTokens: 8192 },
+    { id: 'umans-coder',     name: 'Umans Coder',    family: 'kimi-k2.7-code', maxInputTokens: 256000, maxOutputTokens: 8192, imageInput: true },
+    { id: 'umans-kimi-k2.7', name: 'Umans Kimi K2.7', family: 'kimi-k2.7',     maxInputTokens: 256000, maxOutputTokens: 8192, imageInput: true },
+    { id: 'umans-glm-5.2',   name: 'Umans GLM 5.2',  family: 'glm-5.2',        maxInputTokens: 400000, maxOutputTokens: 8192, imageInput: false },
+    { id: 'umans-flash',     name: 'Umans Flash',     family: 'qwen3.6-35b',    maxInputTokens: 256000, maxOutputTokens: 8192, imageInput: false },
 ];
 
 // OpenAI message types
@@ -23,9 +24,14 @@ interface OpenAIToolCall {
     type: 'function';
     function: { name: string; arguments: string };
 }
+interface OpenAIContentPart {
+    type: 'text' | 'image_url';
+    text?: string;
+    image_url?: { url: string; detail?: string };
+}
 interface OpenAIMessage {
     role: 'system' | 'user' | 'assistant' | 'tool';
-    content?: string | null;
+    content?: string | Array<OpenAIContentPart> | null;
     tool_calls?: OpenAIToolCall[];
     tool_call_id?: string;
     name?: string;
@@ -100,7 +106,7 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
             version: '1.0.0',
             capabilities: {
                 toolCalling: true,
-                imageInput: false,
+                imageInput: m.imageInput,
             },
         }));
     }
@@ -252,12 +258,29 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
         for (const msg of messages) {
             const role = msg.role === vscode.LanguageModelChatMessageRole.User ? 'user' : 'assistant';
             let textParts: string[] = [];
+            const imageParts: OpenAIContentPart[] = [];
             const toolCalls: OpenAIToolCall[] = [];
             const toolResults: { id: string; content: string }[] = [];
 
             for (const part of msg.content) {
                 if (part instanceof vscode.LanguageModelTextPart) {
                     textParts.push(part.value);
+                } else if (part instanceof vscode.LanguageModelDataPart) {
+                    // Convert image data to OpenAI image_url format (base64 data URL)
+                    if (part.mimeType.startsWith('image/')) {
+                        const base64 = UmansProvider.uint8ToBase64(part.data);
+                        imageParts.push({
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:${part.mimeType};base64,${base64}`,
+                            },
+                        });
+                    } else {
+                        // Non-image data parts — include as text representation
+                        try {
+                            textParts.push(`[${part.mimeType}]`);
+                        } catch { /* skip */ }
+                    }
                 } else if (part instanceof vscode.LanguageModelToolCallPart) {
                     toolCalls.push({
                         id: part.callId,
@@ -281,11 +304,19 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
             }
 
             // If the message had only tool results, they're already pushed as 'tool' messages — skip the empty wrapper
-            if (textParts.length === 0 && toolCalls.length === 0 && toolResults.length > 0) {
+            if (textParts.length === 0 && toolCalls.length === 0 && toolResults.length === 0 && imageParts.length === 0) {
                 continue;
             }
 
-            const message: OpenAIMessage = { role, content: textParts.join('') || null };
+            // Build content: array if images present, otherwise string
+            let content: string | Array<OpenAIContentPart> | null;
+            if (imageParts.length > 0) {
+                content = [...textParts.map(t => ({ type: 'text' as const, text: t })), ...imageParts];
+            } else {
+                content = textParts.join('') || null;
+            }
+
+            const message: OpenAIMessage = { role, content };
             if (toolCalls.length > 0) {
                 message.tool_calls = toolCalls;
                 // assistant messages with tool calls can have null content
@@ -296,6 +327,14 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
             out.push(message);
         }
         return out;
+    }
+
+    private static uint8ToBase64(data: Uint8Array): string {
+        let binary = '';
+        for (let i = 0; i < data.length; i++) {
+            binary += String.fromCharCode(data[i]);
+        }
+        return btoa(binary);
     }
 
     // --- SSE parsing ---

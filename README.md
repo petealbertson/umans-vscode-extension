@@ -13,7 +13,7 @@ This extension registers Umans AI models as VS Code Language Model Chat Provider
 | Umans GLM 5.2 | glm-5.2 | 400K |
 | Umans Flash | qwen3.6-35b | 256K |
 
-All models support tool calling. Text only (no image input).
+All models support tool calling. Umans Coder and Umans Kimi K2.7 also support image input (vision); GLM 5.2 and Flash are text-only.
 
 ## Installation
 

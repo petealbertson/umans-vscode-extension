@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0
+
+- Fix: vision/image support for umans-coder and umans-kimi-k2.7 (declared `imageInput: true`)
+- Fix: convert `LanguageModelDataPart` images to OpenAI `image_url` format instead of silently dropping them
+- Prevents 400 errors when images are present in chat history
+
 ## 0.1.0
 
 - Initial release
