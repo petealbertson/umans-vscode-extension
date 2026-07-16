@@ -149,6 +149,7 @@ export class UmansProvider implements vscode.LanguageModelChatProvider {
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken
     ): Promise<void> {
+        UmansProvider.outputChannel.appendLine(`[provideLanguageModelChatResponse] CALLED — model=${model.id}, messages=${messages.length}`);
         const apiKey = await this.getApiKey();
         if (!apiKey) {
             throw new Error('Umans: No API key set. Run "Umans: Set API Key" from the Command Palette.');
